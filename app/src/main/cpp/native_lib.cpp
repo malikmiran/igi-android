@@ -110,6 +110,24 @@ void listRes(const std::string& root, const std::string& rel, int depth, std::ve
     closedir(dp);
 }
 
+// JNI NewStringUTF aborts the process (CheckJNI is on in debug builds) on invalid modified UTF-8.
+// Game text contains Windows-1252 bytes, so reduce everything to printable ASCII.
+std::string sanitize(const std::string& in) {
+    std::string o;
+    o.reserve(in.size());
+    for (unsigned char ch : in) o += (ch == '\n' || (ch >= 32 && ch < 127)) ? (char)ch : '?';
+    return o;
+}
+
+void appendProgress(const std::string& path, const std::string& text, bool truncate = false) {
+    FILE* f = std::fopen(path.c_str(), truncate ? "wb" : "ab");
+    if (!f) return;
+    std::string t = sanitize(text);
+    std::fwrite(t.data(), 1, t.size(), f);
+    std::fflush(f);
+    std::fclose(f);
+}
+
 std::string hexSample(const uint8_t* p, size_t n, size_t maxBytes = 40) {
     static const char* H = "0123456789abcdef";
     std::string o;
@@ -122,19 +140,29 @@ std::string hexSample(const uint8_t* p, size_t n, size_t maxBytes = 40) {
 extern "C" {
 
 // Scans `dir` recursively for *.res files, parses each, and returns a diagnostic report.
-JNIEXPORT jstring JNICALL Java_com_igi_port_Native_scan(JNIEnv* env, jclass, jstring jdir) {
-    const char* c = env->GetStringUTFChars(jdir, nullptr);
-    std::string dir = c; env->ReleaseStringUTFChars(jdir, c);
+}  // extern "C"
+
+namespace {
+
+std::string scanImpl(const std::string& dir) {
+    const std::string progress = dir + "/../scan_progress.txt";
+    appendProgress(progress, "", true);
     std::vector<std::string> names;
     listRes(dir, "", 0, names);
     std::sort(names.begin(), names.end());
-    if (names.empty()) return env->NewStringUTF("No .res files found in the copied folder.");
+    if (names.empty()) return "No .res files found in the copied folder.";
 
     std::string report = std::to_string(names.size()) + " .res archive(s)\n\n";
     std::set<std::string> seenExt, seenForm;
     bool meshLoaded = false;
     int mefFails = 0;
+    size_t flushed = 0;
     for (const std::string& name : names) {
+        // Persist everything so far, then note which archive is about to be processed, so a crash
+        // leaves a trail that the next app start can show.
+        appendProgress(progress, report.substr(flushed));
+        flushed = report.size();
+        appendProgress(progress, "[scanning " + name + "]\n");
         igi::Bytes data = readFile(dir + "/" + name);
         if (data.empty()) { report += name + ": unreadable, empty or over 600MB\n"; continue; }
         size_t mb10 = data.size() / (1024 * 1024 / 10);
@@ -214,7 +242,24 @@ JNIEXPORT jstring JNICALL Java_com_igi_port_Native_scan(JNIEnv* env, jclass, jst
             }
         }
     }
-    return env->NewStringUTF(report.c_str());
+    appendProgress(progress, report.substr(flushed));
+    return report;
+}
+
+}  // namespace
+
+extern "C" {
+
+JNIEXPORT jstring JNICALL Java_com_igi_port_Native_scan(JNIEnv* env, jclass, jstring jdir) {
+    const char* c = env->GetStringUTFChars(jdir, nullptr);
+    std::string dir = c; env->ReleaseStringUTFChars(jdir, c);
+    std::string report;
+    try { report = scanImpl(dir); }
+    catch (const std::exception& e) { report = std::string("Scan aborted by exception: ") + e.what(); }
+    report = sanitize(report);
+    jstring js = env->NewStringUTF(report.c_str());
+    appendProgress(dir + "/../scan_progress.txt", "\n[DONE]\n");
+    return js;
 }
 
 JNIEXPORT void JNICALL Java_com_igi_port_Native_onSurfaceCreated(JNIEnv*, jclass) {

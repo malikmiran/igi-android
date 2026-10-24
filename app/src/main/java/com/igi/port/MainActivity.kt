@@ -115,6 +115,7 @@ class MainActivity : Activity() {
             addView(glView)
             addView(panel, FrameLayout.LayoutParams(1300, ViewGroup.LayoutParams.WRAP_CONTENT))
         })
+        showUnfinishedScan()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -154,6 +155,16 @@ class MainActivity : Activity() {
         walk(root, "", 0)
         if (copied == 0) return "No .res files found. Choose the folder that contains your IGI install."
         return "Copied $copied archive(s).\n\n" + Native.scan(dest.absolutePath)
+    }
+
+    /** If the last scan never reached "[DONE]" the app crashed mid-scan: surface the progress trail. */
+    private fun showUnfinishedScan() {
+        val pf = File(filesDir, "scan_progress.txt")
+        if (!pf.exists()) return
+        val txt = pf.readText()
+        if (txt.trimEnd().endsWith("[DONE]")) return
+        lastReport = "PREVIOUS SCAN DID NOT FINISH (the app crashed). Progress trail:\n\n" + txt
+        status.text = lastReport
     }
 
     /** Full report text; falls back to whatever the panel currently shows (e.g. an error message). */

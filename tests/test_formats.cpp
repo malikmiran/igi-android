@@ -134,8 +134,44 @@ static void testMef() {
     CHECK(!diagnose(b).empty());
 }
 
+// Mutation fuzz: corrupt valid files at random and make sure parsers neither crash nor hang.
+static void fuzz() {
+    uint32_t seed = 12345;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    Bytes res = ilffHeader("IRES");
+    addChunk(res, "NAME", str("LOCAL:a/b.mef")); addChunk(res, "BODY", str("0123456789", false));
+    addChunk(res, "NAME", str("k")); addChunk(res, "CSTR", str("text"));
+    Bytes mef = ilffHeader("OCEM");
+    pstr(mef, "XTRV"); p32(mef, 96); p32(mef, 0); p32(mef, 0);
+    for (int i = 0; i < 24; i++) pf(mef, (float)i);
+    pstr(mef, "ECFC"); p32(mef, 8); p32(mef, 0); p32(mef, 0); p16(mef, 0); p16(mef, 1); p16(mef, 2); p16(mef, 0);
+    Bytes tex; p16(tex, 2); p16(tex, 4); p16(tex, 2); p16(tex, 2); p16(tex, 1); p16(tex, 0); p32(tex, 0);
+    for (int i = 0; i < 256; i++) p32(tex, i);
+    for (int i = 1; i <= 4; i++) tex.push_back((uint8_t)i);
+    for (int iter = 0; iter < 20000; iter++) {
+        for (Bytes* src : {&res, &mef, &tex}) {
+            Bytes m = *src;
+            int muts = 1 + rnd() % 4;
+            for (int k = 0; k < muts; k++) {
+                if (m.empty()) break;
+                size_t at = rnd() % m.size();
+                switch (rnd() % 3) {
+                    case 0: m[at] = (uint8_t)rnd(); break;
+                    case 1: m[at] ^= (uint8_t)(1u << (rnd() % 8)); break;
+                    default: m.resize(at); break;           // truncate
+                }
+            }
+            ResArchive r = parseRes(m);
+            for (auto& e : r.entries) { Bytes o; (void)resRead(r, e, o); (void)formType(r.file.data() + (e.offset < r.file.size() ? e.offset : 0), e.size); }
+            (void)parseMef(m);
+            (void)decodeTex(m);
+            (void)diagnose(m);
+        }
+    }
+}
+
 int main() {
-    testRes(); testResVariants(); testTex(); testMef();
+    testRes(); testResVariants(); testTex(); testMef(); fuzz();
     std::printf(failures ? "%d FAILURE(S)\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }
