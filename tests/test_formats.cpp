@@ -11,15 +11,18 @@ static void p16(Bytes& b, uint16_t v) { b.push_back(v & 0xFF); b.push_back(v >> 
 static void pf(Bytes& b, float f) { uint32_t v; std::memcpy(&v, &f, 4); p32(b, v); }
 static void pstr(Bytes& b, const char* s) { for (int i = 0; i < 4; i++) b.push_back(s[i]); }
 
-static Bytes ilffHeader(const char* form) {
-    // Matches the observed retail header: "ILFF", file size, 4, 0, form type (20 bytes).
-    Bytes b; pstr(b, "ILFF"); p32(b, 0); p32(b, 4); p32(b, 0); pstr(b, form); return b;
+static Bytes ilffHeader(const char* form, uint32_t align = 4) {
+    // Observed retail header: "ILFF", file size, alignment (4, or 32 in common.res), 0, form type.
+    Bytes b; pstr(b, "ILFF"); p32(b, 0); p32(b, align); p32(b, 0); pstr(b, form); return b;
 }
 
-static void addChunk(Bytes& b, const char* id, const Bytes& payload) {
-    pstr(b, id); p32(b, (uint32_t)payload.size()); p32(b, 0); p32(b, 0);
+// Adds a chunk like retail files do: header at an aligned offset, link = distance to the next header.
+static void addChunk(Bytes& b, const char* id, const Bytes& payload, uint32_t align = 4) {
+    while (b.size() % align) b.push_back(0);
+    size_t padded = (16 + payload.size() + align - 1) / align * align;
+    pstr(b, id); p32(b, (uint32_t)payload.size()); p32(b, align); p32(b, (uint32_t)padded);
     b.insert(b.end(), payload.begin(), payload.end());
-    while (b.size() % 4) b.push_back(0);
+    while (b.size() % align) b.push_back(0);
 }
 static Bytes str(const char* s, bool nul = true) { Bytes v(s, s + std::strlen(s)); if (nul) v.push_back(0); return v; }
 
@@ -50,6 +53,43 @@ static void testRes() {
     (void)parseRes(truncated);
     Bytes empty = ilffHeader("IRES");
     CHECK(!parseRes(empty).ok());
+}
+
+static void testResVariants() {
+    // 32-byte aligned archive (common.res): first chunk at offset 32, not 20.
+    Bytes a = ilffHeader("IRES", 32);
+    addChunk(a, "NAME", str("LOCAL:common/x.mef"), 32);
+    addChunk(a, "BODY", str("0123456789", false), 32);
+    addChunk(a, "NAME", str("LOCAL:common/y.mef"), 32);
+    addChunk(a, "BODY", str("zz", false), 32);
+    ResArchive ra = parseRes(a);
+    CHECK(ra.ok() && ra.entries.size() == 2);
+    CHECK(ra.entries[0].name == "LOCAL:common/x.mef" && ra.entries[0].size == 10);
+    CHECK(ra.entries[1].name == "LOCAL:common/y.mef" && ra.entries[1].size == 2);
+    // Same archive with the link word zeroed: falls back to alignment arithmetic.
+    Bytes z = a;
+    for (size_t p = 32; p + 16 <= z.size();) {
+        uint32_t sz = rd32(&z[p + 4]), link = rd32(&z[p + 12]);
+        for (int i = 0; i < 4; i++) z[p + 12 + i] = 0;
+        if (!link) break;
+        p += link; (void)sz;
+    }
+    CHECK(parseRes(z).entries.size() == 2);
+    // String table: NAME + CSTR.
+    Bytes s = ilffHeader("IRES");
+    addChunk(s, "NAME", str("greeting"));
+    addChunk(s, "CSTR", str("Hello"));
+    addChunk(s, "NAME", str("bye"));
+    addChunk(s, "CSTR", str("Goodbye"));
+    ResArchive rs = parseRes(s);
+    CHECK(rs.ok() && rs.entries.size() == 2);
+    CHECK(rs.entries[0].isString && rs.entries[0].name == "greeting");
+    Bytes v; CHECK(resRead(rs, rs.entries[1], v) && std::memcmp(v.data(), "Goodbye", 7) == 0);
+    // Hostile link words must not hang or crash.
+    Bytes h = s; for (int i = 0; i < 4; i++) { h[20 + 12 + i] = 0xFF; }
+    (void)parseRes(h);
+    Bytes h2 = s; h2[20 + 12] = 0; h2[20 + 13] = 0; h2[20 + 14] = 0; h2[20 + 15] = 0;
+    (void)parseRes(h2);
 }
 
 static void testTex() {
@@ -95,7 +135,7 @@ static void testMef() {
 }
 
 int main() {
-    testRes(); testTex(); testMef();
+    testRes(); testResVariants(); testTex(); testMef();
     std::printf(failures ? "%d FAILURE(S)\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }

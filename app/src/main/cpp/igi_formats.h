@@ -41,12 +41,22 @@ struct Chunk {
 
 inline bool isIlff(const Bytes& d) { return d.size() >= kIlffHeader && std::memcmp(d.data(), "ILFF", 4) == 0; }
 
-// Generic walk over 16-byte chunk headers: [fourcc][size][?][link].
-// If the link field points forward inside the file it is used, otherwise the next
-// header is assumed to follow the payload padded to 4 bytes.
-inline std::vector<Chunk> walkChunks(const Bytes& d, size_t start = kIlffHeader, size_t maxChunks = 100000) {
+// Chunk alignment declared by the ILFF header word at offset 8: 4 in most archives, 32 in common.res.
+inline size_t ilffAlign(const Bytes& d) {
+    if (d.size() < kIlffHeader) return 4;
+    uint32_t a = rd32(&d[8]);
+    return (a >= 4 && a <= 4096 && (a & (a - 1)) == 0) ? a : 4;
+}
+inline size_t alignUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
+
+// Walk 16-byte chunk headers: [fourcc][size][alignment][link]. The first chunk sits at the end of the
+// 20-byte header rounded up to the alignment. `link` (observed: distance from this header to the next
+// one) is used when it points forward inside the file; otherwise the next header follows the payload
+// rounded up to the alignment.
+inline std::vector<Chunk> walkChunks(const Bytes& d, size_t start = 0, size_t maxChunks = 100000) {
     std::vector<Chunk> out;
-    size_t pos = start;
+    const size_t al = ilffAlign(d);
+    size_t pos = start ? start : alignUp(kIlffHeader, al);
     while (pos + kChunkHeader <= d.size() && out.size() < maxChunks) {
         Chunk c;
         c.id = fourcc(&d[pos]);
@@ -56,9 +66,8 @@ inline std::vector<Chunk> walkChunks(const Bytes& d, size_t start = kIlffHeader,
         c.offset = pos + kChunkHeader;
         if (c.offset > d.size() || c.size > d.size() - c.offset) break;
         out.push_back(c);
-        uint32_t link = rd32(&d[pos + 12]);
-        size_t next = c.offset + ((c.size + 3u) & ~3u);
-        if (link != 0 && pos + (size_t)link >= c.offset && pos + (size_t)link <= d.size()) next = pos + link;
+        size_t next = alignUp(c.offset + c.size, al);
+        if (c.w3 >= kChunkHeader && c.w3 <= d.size() - pos) next = pos + c.w3;
         if (next <= pos) break;
         pos = next;
     }
@@ -72,9 +81,9 @@ inline std::string diagnose(const Bytes& d, size_t maxChunks = 24) {
     if (d.size() < 4) return o.str() + " (too small)";
     o << " magic=" << fourcc(d.data());
     if (isIlff(d)) {
-        o << " hdr:";
+        o << " align=" << ilffAlign(d) << " hdr:";
         for (size_t i = 4; i < kIlffHeader; i += 4) o << " " << std::hex << rd32(&d[i]) << std::dec;
-        auto ch = walkChunks(d, kIlffHeader, maxChunks);
+        auto ch = walkChunks(d, 0, maxChunks);
         for (auto& c : ch) o << "\n  [" << c.id << "] size=" << c.size << " @" << c.offset << " w2=" << std::hex << c.w2 << " w3=" << c.w3 << std::dec;
     }
     return o.str();
@@ -87,8 +96,9 @@ inline bool chunkIs(const Chunk& c, const char* a) {
 // ----------------------------------------------------------------- RES ----
 struct ResEntry {
     std::string name;     // path string from the NAME chunk (trailing NULs stripped)
-    size_t offset = 0;    // BODY payload offset in the archive file
+    size_t offset = 0;    // BODY/CSTR payload offset in the archive file
     uint32_t size = 0;
+    bool isString = false;  // true for CSTR entries (localisation/text tables), false for BODY (files)
 };
 
 struct ResArchive {
@@ -98,9 +108,9 @@ struct ResArchive {
     bool ok() const { return error.empty(); }
 };
 
-// Layout observed in retail archives (sounds.res): 20-byte ILFF header with form type "IRES" at
-// offset 16, then a flat sequence of 16-byte-header chunks: NAME (entry path) followed by BODY
-// (entry data), each payload padded to 4 bytes. This REPLACES the DIR/DATA layout in the research
+// Layout observed in retail archives: 20-byte ILFF header with form type "IRES" at offset 16, then a
+// flat sequence of 16-byte-header chunks: NAME (entry path or string key) followed by BODY (file data)
+// or CSTR (text value; used by english.res, messages.res, ...), payloads padded to the alignment. This REPLACES the DIR/DATA layout in the research
 // notes, which does not match retail files.
 inline ResArchive parseRes(Bytes file) {
     ResArchive r;
@@ -115,15 +125,16 @@ inline ResArchive parseRes(Bytes file) {
             size_t z = pending.find('\0');
             if (z != std::string::npos) pending.resize(z);
             have = true;
-        } else if (chunkIs(c, "BODY")) {
+        } else if (chunkIs(c, "BODY") || chunkIs(c, "CSTR")) {
             ResEntry e;
             if (have) e.name = pending;
             e.offset = c.offset; e.size = c.size;
+            e.isString = chunkIs(c, "CSTR");
             r.entries.push_back(std::move(e));
             have = false;
         }
     }
-    if (r.entries.empty()) r.error = "no NAME/BODY chunks found";
+    if (r.entries.empty()) r.error = "no NAME/BODY/CSTR chunks found";
     return r;
 }
 

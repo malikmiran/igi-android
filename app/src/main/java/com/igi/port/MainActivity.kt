@@ -131,22 +131,27 @@ class MainActivity : Activity() {
 
     private fun importAndScan(tree: Uri): String {
         val root = DocumentFile.fromTreeUri(this, tree) ?: return "Cannot open that folder."
-        val dest = File(filesDir, "igi").apply { mkdirs() }
+        File(filesDir, "igi").deleteRecursively()          // old flat import (name clashes), no longer used
+        val dest = File(filesDir, "igi_v2").apply { mkdirs() }
         var copied = 0
-        fun walk(dir: DocumentFile, depth: Int) {
+        // Keep the folder structure: several archives share a file name across folders.
+        fun walk(dir: DocumentFile, rel: String, depth: Int) {
             for (f in dir.listFiles()) {
-                if (f.isDirectory && depth < 3) walk(f, depth + 1)
-                else if (f.isFile && f.name?.lowercase()?.endsWith(".res") == true) {
-                    val out = File(dest, f.name!!)
+                val name = (f.name ?: continue).replace("/", "_")
+                if (f.isDirectory) {
+                    if (depth < 6) walk(f, "$rel$name/", depth + 1)
+                } else if (f.isFile && name.lowercase().endsWith(".res")) {
+                    val out = File(dest, "$rel$name")
+                    out.parentFile?.mkdirs()
                     if (!out.exists() || out.length() != f.length()) {
                         contentResolver.openInputStream(f.uri)?.use { i -> out.outputStream().use { o -> i.copyTo(o) } }
                     }
                     copied++
-                    runOnUiThread { status.text = "Copied $copied: ${f.name}" }
+                    runOnUiThread { status.text = "Copied $copied: $rel$name" }
                 }
             }
         }
-        walk(root, 0)
+        walk(root, "", 0)
         if (copied == 0) return "No .res files found. Choose the folder that contains your IGI install."
         return "Copied $copied archive(s).\n\n" + Native.scan(dest.absolutePath)
     }

@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <map>
+#include <set>
+#include <sys/stat.h>
 #include <vector>
 #include <dirent.h>
 #include <fstream>
@@ -89,26 +91,47 @@ void uploadMesh(const igi::Mesh& m) {
     g_vertCount = (GLsizei)(m.verts.size() / 8);
 }
 
+void listRes(const std::string& root, const std::string& rel, int depth, std::vector<std::string>& out) {
+    DIR* dp = opendir((root + (rel.empty() ? "" : "/" + rel)).c_str());
+    if (!dp) return;
+    while (dirent* de = readdir(dp)) {
+        std::string n = de->d_name;
+        if (n == "." || n == "..") continue;
+        std::string r = rel.empty() ? n : rel + "/" + n;
+        std::string full = root + "/" + r;
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) { if (depth < 6) listRes(root, r, depth + 1, out); }
+        else {
+            std::string l = lower(n);
+            if (l.size() > 4 && l.substr(l.size() - 4) == ".res") out.push_back(r);
+        }
+    }
+    closedir(dp);
+}
+
+std::string hexSample(const uint8_t* p, size_t n, size_t maxBytes = 40) {
+    static const char* H = "0123456789abcdef";
+    std::string o;
+    for (size_t i = 0; i < n && i < maxBytes; i++) { o += H[p[i] >> 4]; o += H[p[i] & 15]; o += ' '; }
+    return o;
+}
+
 }  // namespace
 
 extern "C" {
 
-// Scans `dir` for *.res files, parses each, tries the first parseable MEF found, returns a report.
+// Scans `dir` recursively for *.res files, parses each, and returns a diagnostic report.
 JNIEXPORT jstring JNICALL Java_com_igi_port_Native_scan(JNIEnv* env, jclass, jstring jdir) {
     const char* c = env->GetStringUTFChars(jdir, nullptr);
     std::string dir = c; env->ReleaseStringUTFChars(jdir, c);
-    DIR* dp = opendir(dir.c_str());
-    if (!dp) return env->NewStringUTF("Cannot open game folder.");
     std::vector<std::string> names;
-    while (dirent* de = readdir(dp)) {
-        std::string n = de->d_name, l = lower(n);
-        if (l.size() > 4 && l.substr(l.size() - 4) == ".res") names.push_back(n);
-    }
-    closedir(dp);
+    listRes(dir, "", 0, names);
     std::sort(names.begin(), names.end());
     if (names.empty()) return env->NewStringUTF("No .res files found in the copied folder.");
 
-    std::string report;
+    std::string report = std::to_string(names.size()) + " .res archive(s)\n\n";
+    std::set<std::string> seenExt, seenForm;
     bool meshLoaded = false;
     int mefFails = 0;
     for (const std::string& name : names) {
@@ -118,28 +141,64 @@ JNIEXPORT jstring JNICALL Java_com_igi_port_Native_scan(JNIEnv* env, jclass, jst
         igi::ResArchive r = igi::parseRes(std::move(data));
         report += name + " (" + std::to_string(mb10 / 10) + "." + std::to_string(mb10 % 10) + "MB): ";
         if (!r.ok()) { report += "PARSE FAILED (" + r.error + ")\n  " + igi::diagnose(r.file, 8) + "\n"; continue; }
-        report += std::to_string(r.entries.size()) + " entries\n";
 
+        int strings = 0;
         std::map<std::string, int> ext, forms;
         for (auto& e : r.entries) {
+            if (e.isString) { strings++; continue; }
             size_t dot = e.name.rfind('.');
             ext[dot == std::string::npos ? "(none)" : lower(e.name.substr(dot + 1))]++;
             std::string ft = igi::formType(&r.file[e.offset], e.size);
             if (!ft.empty()) forms[ft]++;
         }
-        report += "  ext:";
-        for (auto& kv : ext) report += " " + kv.first + "=" + std::to_string(kv.second);
-        report += "\n  forms:";
-        for (auto& kv : forms) report += " " + kv.first + "=" + std::to_string(kv.second);
-        report += "\n  e.g.";
-        for (size_t i = 0; i < r.entries.size() && i < 3; i++) report += (i ? " | " : " ") + r.entries[i].name;
+        report += std::to_string(r.entries.size()) + " entries";
+        if (strings) report += " (" + std::to_string(strings) + " strings)";
         report += "\n";
+        if (!ext.empty()) {
+            report += "  ext:";
+            for (auto& kv : ext) report += " " + kv.first + "=" + std::to_string(kv.second);
+            report += "\n";
+        }
+        if (!forms.empty()) {
+            report += "  forms:";
+            for (auto& kv : forms) report += " " + kv.first + "=" + std::to_string(kv.second);
+            report += "\n";
+        }
+        int shown = 0;
+        for (auto& e : r.entries) {
+            if (shown >= 3) break;
+            if (e.isString) {
+                igi::Bytes v; igi::resRead(r, e, v);
+                std::string val((const char*)v.data(), v.size());
+                val.resize(strnlen(val.c_str(), val.size()));
+                if (val.size() > 40) val = val.substr(0, 40) + "...";
+                report += "  str: " + e.name + " = " + val + "\n";
+            } else report += "  e.g. " + e.name + "\n";
+            shown++;
+        }
 
         for (auto& e : r.entries) {
-            if (meshLoaded) break;
+            if (e.isString) continue;
+            const uint8_t* p = &r.file[e.offset];
+            size_t dot = e.name.rfind('.');
+            std::string x = dot == std::string::npos ? "(none)" : lower(e.name.substr(dot + 1));
+            std::string ft = igi::formType(p, e.size);
+            // One header sample per file extension / ILFF form type across all archives.
+            if (ft.empty() && seenExt.insert(x).second) {
+                report += "  SAMPLE ." + x + " " + e.name + " size=" + std::to_string(e.size) + "\n    " + hexSample(p, e.size) + "\n";
+                if (x == "tex") {
+                    igi::Bytes blob; igi::resRead(r, e, blob);
+                    igi::Image im = igi::decodeTex(blob);
+                    report += im.ok() ? "    TEX decode OK " + std::to_string(im.w) + "x" + std::to_string(im.h) + "\n"
+                                      : "    TEX decode failed: " + im.error + "\n";
+                }
+            } else if (!ft.empty() && ft != "OCEM" && seenForm.insert(ft).second) {
+                igi::Bytes blob; igi::resRead(r, e, blob);
+                report += "  SAMPLE form " + ft + " " + e.name + "\n  " + igi::diagnose(blob, 10) + "\n";
+            }
+            if (meshLoaded) continue;
             std::string ln = lower(e.name);
-            bool isMef = (ln.size() > 4 && ln.substr(ln.size() - 4) == ".mef") ||
-                         igi::formType(&r.file[e.offset], e.size) == "OCEM";
+            bool isMef = (ln.size() > 4 && ln.substr(ln.size() - 4) == ".mef") || ft == "OCEM";
             if (!isMef) continue;
             igi::Bytes blob;
             if (!igi::resRead(r, e, blob)) continue;
