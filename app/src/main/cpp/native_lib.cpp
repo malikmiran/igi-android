@@ -4,7 +4,10 @@
 #include <GLES3/gl3.h>
 #include <android/log.h>
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
+#include <map>
+#include <vector>
 #include <dirent.h>
 #include <fstream>
 #include <mutex>
@@ -24,11 +27,22 @@ GLuint g_prog = 0, g_vbo = 0, g_ibo = 0;
 GLsizei g_indexCount = 0, g_vertCount = 0;
 GLint g_uMvp = -1;
 
-igi::Bytes readFile(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+igi::Bytes readFile(const std::string& path, size_t maxBytes = (size_t)600 << 20) {
+    FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return {};
-    return igi::Bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    igi::Bytes out;
+    if (n > 0 && (size_t)n <= maxBytes) {
+        out.resize((size_t)n);
+        if (std::fread(out.data(), 1, (size_t)n, f) != (size_t)n) out.clear();
+    }
+    std::fclose(f);
+    return out;
 }
+
+std::string lower(std::string s) { for (auto& c : s) c = (char)std::tolower((unsigned char)c); return s; }
 
 GLuint compile(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
@@ -83,36 +97,64 @@ extern "C" {
 JNIEXPORT jstring JNICALL Java_com_igi_port_Native_scan(JNIEnv* env, jclass, jstring jdir) {
     const char* c = env->GetStringUTFChars(jdir, nullptr);
     std::string dir = c; env->ReleaseStringUTFChars(jdir, c);
-    std::string report;
     DIR* dp = opendir(dir.c_str());
     if (!dp) return env->NewStringUTF("Cannot open game folder.");
-    bool meshLoaded = false;
-    int resCount = 0;
+    std::vector<std::string> names;
     while (dirent* de = readdir(dp)) {
-        std::string name = de->d_name;
-        std::string low; for (char ch : name) low += (char)std::tolower((unsigned char)ch);
-        if (low.size() < 4 || low.substr(low.size() - 4) != ".res") continue;
-        resCount++;
+        std::string n = de->d_name, l = lower(n);
+        if (l.size() > 4 && l.substr(l.size() - 4) == ".res") names.push_back(n);
+    }
+    closedir(dp);
+    std::sort(names.begin(), names.end());
+    if (names.empty()) return env->NewStringUTF("No .res files found in the copied folder.");
+
+    std::string report;
+    bool meshLoaded = false;
+    int mefFails = 0;
+    for (const std::string& name : names) {
         igi::Bytes data = readFile(dir + "/" + name);
-        igi::ResArchive r = igi::parseRes(data);
-        report += name + ": ";
-        if (!r.ok()) { report += "PARSE FAILED (" + r.error + ")\n  " + igi::diagnose(data, 8) + "\n"; continue; }
+        if (data.empty()) { report += name + ": unreadable, empty or over 600MB\n"; continue; }
+        size_t mb10 = data.size() / (1024 * 1024 / 10);
+        igi::ResArchive r = igi::parseRes(std::move(data));
+        report += name + " (" + std::to_string(mb10 / 10) + "." + std::to_string(mb10 % 10) + "MB): ";
+        if (!r.ok()) { report += "PARSE FAILED (" + r.error + ")\n  " + igi::diagnose(r.file, 8) + "\n"; continue; }
         report += std::to_string(r.entries.size()) + " entries\n";
+
+        std::map<std::string, int> ext, forms;
+        for (auto& e : r.entries) {
+            size_t dot = e.name.rfind('.');
+            ext[dot == std::string::npos ? "(none)" : lower(e.name.substr(dot + 1))]++;
+            std::string ft = igi::formType(&r.file[e.offset], e.size);
+            if (!ft.empty()) forms[ft]++;
+        }
+        report += "  ext:";
+        for (auto& kv : ext) report += " " + kv.first + "=" + std::to_string(kv.second);
+        report += "\n  forms:";
+        for (auto& kv : forms) report += " " + kv.first + "=" + std::to_string(kv.second);
+        report += "\n  e.g.";
+        for (size_t i = 0; i < r.entries.size() && i < 3; i++) report += (i ? " | " : " ") + r.entries[i].name;
+        report += "\n";
+
         for (auto& e : r.entries) {
             if (meshLoaded) break;
+            std::string ln = lower(e.name);
+            bool isMef = (ln.size() > 4 && ln.substr(ln.size() - 4) == ".mef") ||
+                         igi::formType(&r.file[e.offset], e.size) == "OCEM";
+            if (!isMef) continue;
             igi::Bytes blob;
             if (!igi::resRead(r, e, blob)) continue;
             igi::Mesh m = igi::parseMef(blob);
             if (m.ok() && !m.indices.empty()) {
                 std::lock_guard<std::mutex> lk(g_mu);
                 g_mesh = std::move(m); g_meshDirty = true; meshLoaded = true;
-                report += "  first MEF mesh: " + std::to_string(g_mesh.verts.size() / 8) + " verts, " +
+                report += "  LOADED MESH " + e.name + ": " + std::to_string(g_mesh.verts.size() / 8) + " verts, " +
                           std::to_string(g_mesh.indices.size() / 3) + " tris\n";
+            } else if (mefFails < 3) {
+                mefFails++;
+                report += "  MEF parse failed (" + m.error + "): " + e.name + "\n  " + igi::diagnose(blob, 12) + "\n";
             }
         }
     }
-    closedir(dp);
-    if (!resCount) report = "No .res files found in the copied folder.";
     return env->NewStringUTF(report.c_str());
 }
 

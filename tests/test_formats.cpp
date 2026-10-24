@@ -12,31 +12,44 @@ static void pf(Bytes& b, float f) { uint32_t v; std::memcpy(&v, &f, 4); p32(b, v
 static void pstr(Bytes& b, const char* s) { for (int i = 0; i < 4; i++) b.push_back(s[i]); }
 
 static Bytes ilffHeader(const char* form) {
-    Bytes b; pstr(b, "ILFF"); p32(b, 0); pstr(b, form); p32(b, 1); p32(b, 0); return b;  // 20 bytes
+    // Matches the observed retail header: "ILFF", file size, 4, 0, form type (20 bytes).
+    Bytes b; pstr(b, "ILFF"); p32(b, 0); p32(b, 4); p32(b, 0); pstr(b, form); return b;
 }
 
+static void addChunk(Bytes& b, const char* id, const Bytes& payload) {
+    pstr(b, id); p32(b, (uint32_t)payload.size()); p32(b, 0); p32(b, 0);
+    b.insert(b.end(), payload.begin(), payload.end());
+    while (b.size() % 4) b.push_back(0);
+}
+static Bytes str(const char* s, bool nul = true) { Bytes v(s, s + std::strlen(s)); if (nul) v.push_back(0); return v; }
+
 static void testRes() {
-    Bytes b = ilffHeader("RES ");
+    Bytes b = ilffHeader("IRES");
     CHECK(b.size() == 20);
-    pstr(b, "DIR "); p32(b, 4 + 2 * 24); p32(b, 2);
-    // entry 0: hash, offset 0, size 5, packed 5, flags 0, nameoff
-    p32(b, 0xAAAA); p32(b, 0); p32(b, 5); p32(b, 5); p32(b, 0); p32(b, 0);
-    p32(b, 0xBBBB); p32(b, 8); p32(b, 3); p32(b, 3); p32(b, 1); p32(b, 0);  // compressed
-    pstr(b, "DATA"); p32(b, 16);
-    const char* payload = "hello\0\0\0abc";
-    for (int i = 0; i < 11; i++) b.push_back(payload[i]);
+    addChunk(b, "NAME", str("sounds/a.wav"));
+    addChunk(b, "BODY", str("hello", false));        // odd length -> padded
+    addChunk(b, "NAME", str("models/gun.mef"));
+    addChunk(b, "BODY", str("abcdefgh", false));
+    addChunk(b, "BODY", str("orphan", false));       // BODY without a NAME
     ResArchive r = parseRes(b);
     CHECK(r.ok());
-    CHECK(r.entries.size() == 2);
-    CHECK(r.entries[0].nameHash == 0xAAAA);
+    CHECK(r.entries.size() == 3);
+    CHECK(r.entries[0].name == "sounds/a.wav");
+    CHECK(r.entries[1].name == "models/gun.mef");
+    CHECK(r.entries[2].name.empty());
     Bytes out;
     CHECK(resRead(r, r.entries[0], out));
     CHECK(out.size() == 5 && std::memcmp(out.data(), "hello", 5) == 0);
-    CHECK(!resRead(r, r.entries[1], out));  // compressed unsupported
-    Bytes bad = b; bad[20] = 'X';
+    CHECK(resRead(r, r.entries[1], out) && out.size() == 8);
+    CHECK(formType(b.data(), b.size()) == "IRES");
+    Bytes bad = b; bad[0] = 'X';
     CHECK(!parseRes(bad).ok());
     Bytes tiny(3, 0);
     CHECK(!parseRes(tiny).ok());
+    Bytes truncated(b.begin(), b.begin() + 50);      // cut mid-chunk: must not crash
+    (void)parseRes(truncated);
+    Bytes empty = ilffHeader("IRES");
+    CHECK(!parseRes(empty).ok());
 }
 
 static void testTex() {

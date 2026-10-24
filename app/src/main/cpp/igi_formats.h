@@ -36,6 +36,7 @@ struct Chunk {
     std::string id;       // FourCC as stored on disk (IGI stores several reversed, e.g. XTRV, ECFC)
     uint32_t size = 0;    // payload size
     size_t offset = 0;    // payload offset in file
+    uint32_t w2 = 0, w3 = 0;  // the two remaining header words (meaning not yet established)
 };
 
 inline bool isIlff(const Bytes& d) { return d.size() >= kIlffHeader && std::memcmp(d.data(), "ILFF", 4) == 0; }
@@ -50,6 +51,8 @@ inline std::vector<Chunk> walkChunks(const Bytes& d, size_t start = kIlffHeader,
         Chunk c;
         c.id = fourcc(&d[pos]);
         c.size = rd32(&d[pos + 4]);
+        c.w2 = rd32(&d[pos + 8]);
+        c.w3 = rd32(&d[pos + 12]);
         c.offset = pos + kChunkHeader;
         if (c.offset > d.size() || c.size > d.size() - c.offset) break;
         out.push_back(c);
@@ -72,65 +75,68 @@ inline std::string diagnose(const Bytes& d, size_t maxChunks = 24) {
         o << " hdr:";
         for (size_t i = 4; i < kIlffHeader; i += 4) o << " " << std::hex << rd32(&d[i]) << std::dec;
         auto ch = walkChunks(d, kIlffHeader, maxChunks);
-        for (auto& c : ch) o << "\n  [" << c.id << "] size=" << c.size << " @" << c.offset;
+        for (auto& c : ch) o << "\n  [" << c.id << "] size=" << c.size << " @" << c.offset << " w2=" << std::hex << c.w2 << " w3=" << c.w3 << std::dec;
     }
     return o.str();
 }
 
+inline bool chunkIs(const Chunk& c, const char* a) {
+    std::string rev(a); return c.id == rev || std::string(c.id.rbegin(), c.id.rend()) == rev;
+}
+
 // ----------------------------------------------------------------- RES ----
 struct ResEntry {
-    uint32_t nameHash = 0, dataOffset = 0, unpackedSize = 0, packedSize = 0, flags = 0, nameOffset = 0;
+    std::string name;     // path string from the NAME chunk (trailing NULs stripped)
+    size_t offset = 0;    // BODY payload offset in the archive file
+    uint32_t size = 0;
 };
 
 struct ResArchive {
     Bytes file;
     std::vector<ResEntry> entries;
-    size_t dataBase = 0;   // file offset of the DATA chunk payload
     std::string error;
     bool ok() const { return error.empty(); }
 };
 
-// Layout per research notes: 20-byte ILFF header, then "DIR " chunk header
-// (fourcc, size, entry_count) followed by 24-byte entries, then a "DATA" chunk.
+// Layout observed in retail archives (sounds.res): 20-byte ILFF header with form type "IRES" at
+// offset 16, then a flat sequence of 16-byte-header chunks: NAME (entry path) followed by BODY
+// (entry data), each payload padded to 4 bytes. This REPLACES the DIR/DATA layout in the research
+// notes, which does not match retail files.
 inline ResArchive parseRes(Bytes file) {
     ResArchive r;
     r.file = std::move(file);
     const Bytes& d = r.file;
     if (!isIlff(d)) { r.error = "not an ILFF file"; return r; }
-    size_t pos = kIlffHeader;
-    if (pos + 12 > d.size() || std::memcmp(&d[pos], "DIR ", 4) != 0) {
-        r.error = "no DIR chunk at 0x14 (layout differs from notes) - see diagnose()";
-        return r;
+    std::string pending;
+    bool have = false;
+    for (const Chunk& c : walkChunks(d)) {
+        if (chunkIs(c, "NAME")) {
+            pending.assign((const char*)&d[c.offset], c.size);
+            size_t z = pending.find('\0');
+            if (z != std::string::npos) pending.resize(z);
+            have = true;
+        } else if (chunkIs(c, "BODY")) {
+            ResEntry e;
+            if (have) e.name = pending;
+            e.offset = c.offset; e.size = c.size;
+            r.entries.push_back(std::move(e));
+            have = false;
+        }
     }
-    uint32_t dirSize = rd32(&d[pos + 4]);
-    uint32_t count = rd32(&d[pos + 8]);
-    size_t entriesAt = pos + 12;
-    if ((uint64_t)count * 24 + entriesAt > d.size()) { r.error = "entry count exceeds file size"; return r; }
-    for (uint32_t i = 0; i < count; i++) {
-        const uint8_t* p = &d[entriesAt + (size_t)i * 24];
-        ResEntry e;
-        e.nameHash = rd32(p); e.dataOffset = rd32(p + 4); e.unpackedSize = rd32(p + 8);
-        e.packedSize = rd32(p + 12); e.flags = rd32(p + 16); e.nameOffset = rd32(p + 20);
-        r.entries.push_back(e);
-    }
-    size_t after = pos + 8 + dirSize;                 // size assumed to cover count + entries
-    if (after + 8 <= d.size() && std::memcmp(&d[after], "DATA", 4) == 0) r.dataBase = after + 8;
-    else {
-        size_t guess = entriesAt + (size_t)count * 24;
-        for (size_t p = guess; p + 8 <= d.size() && p < guess + 4096; p++)
-            if (std::memcmp(&d[p], "DATA", 4) == 0) { r.dataBase = p + 8; break; }
-    }
-    if (!r.dataBase) r.error = "DATA chunk not found";
+    if (r.entries.empty()) r.error = "no NAME/BODY chunks found";
     return r;
 }
 
-// Returns raw (uncompressed-flag only) bytes of an entry; compressed entries unsupported yet.
 inline bool resRead(const ResArchive& r, const ResEntry& e, Bytes& out) {
-    if (e.flags != 0) return false;
-    size_t off = r.dataBase + e.dataOffset;
-    if (off > r.file.size() || e.packedSize > r.file.size() - off) return false;
-    out.assign(r.file.begin() + off, r.file.begin() + off + e.packedSize);
+    if (e.offset > r.file.size() || e.size > r.file.size() - e.offset) return false;
+    out.assign(r.file.begin() + e.offset, r.file.begin() + e.offset + e.size);
     return true;
+}
+
+// Form type (bytes 16..19) of an ILFF blob, or "" if it is not ILFF.
+inline std::string formType(const uint8_t* p, size_t n) {
+    if (n < kIlffHeader || std::memcmp(p, "ILFF", 4) != 0) return "";
+    return fourcc(p + 16);
 }
 
 // ----------------------------------------------------------------- TEX ----
@@ -176,9 +182,6 @@ struct Mesh {
     bool ok() const { return error.empty() && !verts.empty(); }
 };
 
-inline bool chunkIs(const Chunk& c, const char* a) {
-    std::string rev(a); return c.id == rev || std::string(c.id.rbegin(), c.id.rend()) == rev;
-}
 
 // Reads XTRV (vertices; 32-byte stride for type 0, 40 for types 1/3) and ECFC (8-byte face records,
 // first three uint16 = triangle indices). Stride is inferred from the payload size and the face indices.

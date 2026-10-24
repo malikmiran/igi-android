@@ -1,6 +1,10 @@
 package com.igi.port
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -30,6 +34,7 @@ class MainActivity : Activity() {
     private lateinit var scale: ScaleGestureDetector
     private var lastX = 0f
     private var lastY = 0f
+    private var lastReport = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -67,6 +72,7 @@ class MainActivity : Activity() {
         status = TextView(this).apply {
             setTextColor(Color.WHITE); textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE
             setPadding(16, 16, 16, 16)
+            setTextIsSelectable(true)
             text = "Pick the folder where your own copy of Project I.G.I. is installed.\n" +
                     "The .res archives will be copied into this app's private storage."
         }
@@ -74,16 +80,40 @@ class MainActivity : Activity() {
             text = "Select IGI folder"
             setOnClickListener { startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_TREE) }
         }
+        val copy = Button(this).apply {
+            text = "Copy log"
+            setOnClickListener {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("IGI report", currentLog()))
+                Toast.makeText(this@MainActivity, "Log copied (" + currentLog().length + " chars)", Toast.LENGTH_SHORT).show()
+            }
+        }
+        val share = Button(this).apply {
+            text = "Share log"
+            setOnClickListener {
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, currentLog())
+                }
+                startActivity(Intent.createChooser(send, "Share IGI log"))
+            }
+        }
+        val buttons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(pick, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
+            addView(copy, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(share, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(200, 0, 0, 0))
-            addView(pick)
+            setBackgroundColor(Color.argb(210, 0, 0, 0))
+            addView(buttons)
             addView(ScrollView(this@MainActivity).apply { addView(status) },
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 360))
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 520))
         }
         setContentView(FrameLayout(this).apply {
             addView(glView)
-            addView(panel, FrameLayout.LayoutParams(900, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(panel, FrameLayout.LayoutParams(1300, ViewGroup.LayoutParams.WRAP_CONTENT))
         })
     }
 
@@ -94,6 +124,7 @@ class MainActivity : Activity() {
         status.text = "Copying .res files..."
         Thread {
             val result = try { importAndScan(uri) } catch (t: Throwable) { "Import failed: ${t.message}" }
+            lastReport = result
             runOnUiThread { status.text = result }
         }.start()
     }
@@ -119,6 +150,9 @@ class MainActivity : Activity() {
         if (copied == 0) return "No .res files found. Choose the folder that contains your IGI install."
         return "Copied $copied archive(s).\n\n" + Native.scan(dest.absolutePath)
     }
+
+    /** Full report text; falls back to whatever the panel currently shows (e.g. an error message). */
+    private fun currentLog(): String = if (lastReport.isNotEmpty()) lastReport else status.text.toString()
 
     override fun onPause() { super.onPause(); glView.onPause() }
     override fun onResume() { super.onResume(); glView.onResume() }
